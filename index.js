@@ -22,6 +22,7 @@ import fs from "fs";
 import path from "path";
 import nacl from "tweetnacl";
 import bs58 from "bs58";
+import { Buffer } from "buffer";
 import { PublicKey, Connection, Keypair, Transaction } from "@solana/web3.js";
 import {
   getAssociatedTokenAddressSync,
@@ -56,14 +57,18 @@ const DISTRIBUTOR = Keypair.fromSecretKey(Uint8Array.from(distributorSecret));
 
 const connection = new Connection(RPC_URL, "confirmed");
 
+// Store claims locally (weekly reset).
+// NOTE: On Render Free this filesystem may reset on redeploy/restart.
+// Weekly reset is handled logically by weekId.
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
 const CLAIMS_FILE = path.join(DATA_DIR, "claims.json");
 
 // --- config ---
 const CHALLENGE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const PENDING_TTL_MS = 20 * 60 * 1000;   // 20 minutes
+const PENDING_TTL_MS = 20 * 60 * 1000; // 20 minutes
 
 function currentWeekIdUTC() {
+  // Week counter within year (simple, deterministic; good enough for weekly reset)
   const d = new Date();
   const year = d.getUTCFullYear();
   const start = new Date(Date.UTC(year, 0, 1));
@@ -111,6 +116,7 @@ function cleanupDb(db) {
   }
 }
 
+// Message user signs (no SOL, just signature)
 function buildClaimMessage(userPubkey, nonce, weekId, expiresAt) {
   return [
     "Flexion Support Mark (FSM) — Claim",
@@ -123,11 +129,19 @@ function buildClaimMessage(userPubkey, nonce, weekId, expiresAt) {
   ].join("\n");
 }
 
+/**
+ * NOTE: name kept as-is ("Bs58") to avoid touching call-sites.
+ * Actual expected encoding for `signature` here is BASE64 (from the frontend).
+ */
 function verifySignatureBs58({ userPubkey, message, signature }) {
   const pubkey = new PublicKey(userPubkey);
   const msgBytes = new TextEncoder().encode(message);
-  const sigBytes = Uint8Array.from(Buffer.from(signature, "base64"));
-  return nacl.sign.detached.verify(msgBytes, sigBytes, pubkey.toBytes());
+
+  // base64 -> Uint8Array
+  const sigBuf = Buffer.from(String(signature), "base64");
+  if (sigBuf.length !== 64) return false; // ed25519 signature must be 64 bytes
+
+  return nacl.sign.detached.verify(msgBytes, new Uint8Array(sigBuf), pubkey.toBytes());
 }
 
 function parseHumanAmountToU64BigInt(humanStr, decimals) {
@@ -276,13 +290,14 @@ app.post("/claim", async (req, res) => {
 
     const ixs = [];
 
+    // Create user's ATA if missing (paid by distributor)
     if (!(await ataExists(userAta))) {
       ixs.push(
         createAssociatedTokenAccountInstruction(
           DISTRIBUTOR.publicKey, // payer
-          userAta,
-          userPk,
-          FSM_MINT
+          userAta, // ata
+          userPk, // owner
+          FSM_MINT // mint
         )
       );
     }
@@ -292,12 +307,14 @@ app.post("/claim", async (req, res) => {
 
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
 
+    // Distributor pays the network fee -> user needs 0 SOL
     const tx = new Transaction({
       feePayer: DISTRIBUTOR.publicKey,
       blockhash,
       lastValidBlockHeight,
     }).add(...ixs);
 
+    // Fully sign with distributor (fee payer + transfer authority + ATA payer)
     tx.sign(DISTRIBUTOR);
 
     const txBase64 = tx.serialize().toString("base64");
@@ -311,6 +328,7 @@ app.post("/claim", async (req, res) => {
         saveDb(db);
       }
     } catch {}
+
     return res.status(500).json({ error: String(e?.message || e) });
   }
 });
