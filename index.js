@@ -54,6 +54,8 @@ const FSM_DECIMALS = Number(process.env.FSM_DECIMALS ?? "6");
 const FSM_AMOUNT_HUMAN = String(process.env.FSM_AMOUNT ?? "1"); // keep as string
 const distributorSecret = JSON.parse(mustEnv("DISTRIBUTOR_SECRET_KEY"));
 const DISTRIBUTOR = Keypair.fromSecretKey(Uint8Array.from(distributorSecret));
+const CONFIRM_MAX_WAIT_MS = 30 * 1000; //
+const CONFIRM_POLL_MS = 1500;          // 1.5s
 
 const connection = new Connection(RPC_URL, "confirmed");
 
@@ -386,11 +388,29 @@ app.post("/confirm", async (req, res) => {
       return res.status(400).json({ error: "No pending claim for this wallet" });
     }
 
-    const st = await connection.getSignatureStatus(txSig, { searchTransactionHistory: true });
-    const cs = st?.value?.confirmationStatus;
-    const ok = cs === "confirmed" || cs === "finalized";
-    if (!ok) return res.status(400).json({ error: "Transaction not confirmed yet" });
+    // WAIT for confirmation (poll, no websocket)
+    const deadline = Date.now() + CONFIRM_MAX_WAIT_MS;
+    let cs = null;
 
+    while (Date.now() < deadline) {
+      const st = await connection.getSignatureStatus(txSig, { searchTransactionHistory: true });
+      cs = st?.value?.confirmationStatus;
+
+      if (cs === "confirmed" || cs === "finalized") break;
+
+      // also stop early if tx failed
+      if (st?.value?.err) {
+        return res.status(400).json({ error: "Transaction failed" });
+      }
+
+      await new Promise((r) => setTimeout(r, CONFIRM_POLL_MS));
+    }
+
+    if (!(cs === "confirmed" || cs === "finalized")) {
+      return res.status(400).json({ error: "Transaction not confirmed yet" });
+    }
+
+    // Verify tx content (FSM transfer)
     const v = await validateTransferTx({ txSig, userWallet: wallet });
     if (!v.ok) return res.status(400).json({ error: v.reason });
 
