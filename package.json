@@ -1,0 +1,16 @@
+// package.json (минимум)
+{
+  "name": "fsm-claim-backend",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.98.0",
+    "bs58": "^5.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "tweetnacl": "^1.0.3"
+  }
+}
