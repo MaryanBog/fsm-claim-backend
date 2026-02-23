@@ -357,6 +357,9 @@ app.post("/submit", async (req, res) => {
 
     const db = loadDb();
     cleanupDb(db);
+    if (db.claimed[wallet]) {
+      return res.status(409).json({ error: "Already claimed this week" });
+    }
 
     if (!db.pending[wallet]) {
       return res.status(400).json({ error: "No pending claim for this wallet" });
@@ -366,6 +369,8 @@ app.post("/submit", async (req, res) => {
 
     // send from backend (Helius RPC), not browser
     const txSig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
+    db.pending[wallet] = { at: nowMs(), expiresAt: nowMs() + PENDING_TTL_MS, txSig };
+    saveDb(db);
 
     return res.json({ txSig, weekId: db.weekId });
   } catch (e) {
@@ -388,6 +393,10 @@ app.post("/confirm", async (req, res) => {
       return res.status(400).json({ error: "No pending claim for this wallet" });
     }
 
+    const p = db.pending[wallet];
+    if (p?.txSig && p.txSig !== txSig) {
+    return res.status(409).json({ error: "Different tx already pending for this wallet" });
+    }
     // WAIT for confirmation (poll, no websocket)
     const deadline = Date.now() + CONFIRM_MAX_WAIT_MS;
     let cs = null;
