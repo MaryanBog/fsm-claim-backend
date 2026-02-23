@@ -348,6 +348,29 @@ app.post("/claim", async (req, res) => {
   }
 });
 
+app.post("/submit", async (req, res) => {
+  try {
+    const { wallet, txBase64 } = req.body || {};
+    if (!wallet || !txBase64) return res.status(400).json({ error: "wallet, txBase64 required" });
+
+    const db = loadDb();
+    cleanupDb(db);
+
+    if (!db.pending[wallet]) {
+      return res.status(400).json({ error: "No pending claim for this wallet" });
+    }
+
+    const tx = Transaction.from(Buffer.from(String(txBase64), "base64"));
+
+    // send from backend (Helius RPC), not browser
+    const txSig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
+
+    return res.json({ txSig, weekId: db.weekId });
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
 // Step 2: client confirms after sending tx; server verifies tx content
 app.post("/confirm", async (req, res) => {
   try {
