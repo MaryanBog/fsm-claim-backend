@@ -126,7 +126,7 @@ function buildClaimMessage(userPubkey, nonce, weekId, expiresAt) {
 function verifySignatureBs58({ userPubkey, message, signature }) {
   const pubkey = new PublicKey(userPubkey);
   const msgBytes = new TextEncoder().encode(message);
-  const sigBytes = bs58.decode(signature);
+  const sigBytes = Uint8Array.from(Buffer.from(signature, "base64"));
   return nacl.sign.detached.verify(msgBytes, sigBytes, pubkey.toBytes());
 }
 
