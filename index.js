@@ -26,7 +26,6 @@ import { Buffer } from "buffer";
 import { PublicKey, Connection, Keypair, Transaction } from "@solana/web3.js";
 import {
   getAssociatedTokenAddressSync,
-  createAssociatedTokenAccountInstruction,
   createAssociatedTokenAccountIdempotentInstruction,
   createTransferInstruction,
 } from "@solana/spl-token";
@@ -260,7 +259,9 @@ app.post("/claim", async (req, res) => {
     }
 
     const ch = db.challenges[wallet];
-    if (!ch) return res.status(400).json({ error: "No active challenge. Call /challenge first." });
+    if (!ch) {
+      return res.status(400).json({ error: "No active challenge. Call /challenge first." });
+    }
     if (nowMs() > ch.expiresAt) {
       delete db.challenges[wallet];
       saveDb(db);
@@ -271,7 +272,6 @@ app.post("/claim", async (req, res) => {
       return res.status(400).json({ error: "Invalid signature" });
     }
 
-    // Prevent concurrent claim attempts
     if (db.pending[wallet]) {
       return res.status(429).json({ error: "Claim already pending for this wallet" });
     }
@@ -286,37 +286,41 @@ app.post("/claim", async (req, res) => {
 
     const ixs = [];
 
-    // Create user's ATA if missing (paid by distributor)
-    if (!(await ataExists(userAta))) {
-      ixs.push(
-        createAssociatedTokenAccountIdempotentInstruction(
-          DISTRIBUTOR.publicKey, // payer
-          userAta,               // ata
-          userPk,                // owner
-          FSM_MINT               // mint
-        )
-      );
-    }
+    // 1) Ensure user's ATA exists (idempotent)
+    ixs.push(
+      createAssociatedTokenAccountIdempotentInstruction(
+        DISTRIBUTOR.publicKey, // payer
+        userAta,               // ata
+        userPk,                // owner
+        FSM_MINT               // mint
+      )
+    );
 
+    // 2) Transfer FSM
     const amount = parseHumanAmountToU64BigInt(FSM_AMOUNT_HUMAN, FSM_DECIMALS);
-    ixs.push(createTransferInstruction(distributorAta, userAta, DISTRIBUTOR.publicKey, amount));
+    ixs.push(
+      createTransferInstruction(
+        distributorAta,         // source
+        userAta,                // destination
+        DISTRIBUTOR.publicKey,  // authority
+        amount                  // u64 amount (BigInt)
+      )
+    );
 
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    const { blockhash, lastValidBlockHeight } =
+      await connection.getLatestBlockhash("confirmed");
 
-    // Distributor pays the network fee -> user needs 0 SOL
     const tx = new Transaction({
       feePayer: DISTRIBUTOR.publicKey,
       blockhash,
       lastValidBlockHeight,
     }).add(...ixs);
 
-    // Fully sign with distributor (fee payer + transfer authority + ATA payer)
     tx.sign(DISTRIBUTOR);
 
     const txBase64 = tx.serialize().toString("base64");
     return res.json({ txBase64, weekId: db.weekId });
   } catch (e) {
-    // best-effort: clear pending on failure
     try {
       if (wallet) {
         const db = loadDb();
