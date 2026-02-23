@@ -1,4 +1,3 @@
-// package.json (минимум)
 {
   "name": "fsm-claim-backend",
   "type": "module",
