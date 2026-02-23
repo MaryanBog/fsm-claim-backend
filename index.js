@@ -1,22 +1,20 @@
-// index.js — minimal FSM claim backend (Render)
+// index.js — FSM claim backend (fixed v2)
 // Node 18+
 //
 // Endpoints:
-//   GET  /health   -> { ok: true }
-//   POST /claim    -> returns { txBase64, message, alreadyClaimed?, weekId? }
-//   POST /confirm  -> returns { ok: true } after client submits tx
+//   GET  /health      -> { ok: true }
+//   POST /challenge   -> { message, nonce, expiresAt, weekId }
+//   POST /claim       -> { txBase64, weekId }
+//   POST /confirm     -> { ok: true, weekId }
 //
-// Env vars required:
+// Env:
 //   RPC_URL=...
-//   FSM_MINT=7Admm1BZYi91xaS54D3ELnbP78VM1a1creUe2uVcibZ2
+//   FSM_MINT=...
 //   FSM_DECIMALS=6
 //   FSM_AMOUNT=1
-//   DISTRIBUTOR_SECRET_KEY=[...]  // Solana keypair secretKey array JSON
-//   ALLOWED_ORIGIN=https://lockrion.com (optional)
-//   PORT=3000 (Render provides)
-
-// --- deps ---
-// npm i express cors tweetnacl bs58 @solana/web3.js @solana/spl-token
+//   DISTRIBUTOR_SECRET_KEY=[...]
+//   ALLOWED_ORIGIN=... (optional)
+//   PORT=3000
 
 import express from "express";
 import cors from "cors";
@@ -52,21 +50,20 @@ function mustEnv(name) {
 const RPC_URL = mustEnv("RPC_URL");
 const FSM_MINT = new PublicKey(mustEnv("FSM_MINT"));
 const FSM_DECIMALS = Number(process.env.FSM_DECIMALS ?? "6");
-const FSM_AMOUNT_HUMAN = Number(process.env.FSM_AMOUNT ?? "1");
-
+const FSM_AMOUNT_HUMAN = String(process.env.FSM_AMOUNT ?? "1"); // keep as string
 const distributorSecret = JSON.parse(mustEnv("DISTRIBUTOR_SECRET_KEY"));
 const DISTRIBUTOR = Keypair.fromSecretKey(Uint8Array.from(distributorSecret));
 
 const connection = new Connection(RPC_URL, "confirmed");
 
-// Store claims locally (weekly reset).
-// NOTE: On Render Free this filesystem may reset on redeploy/restart.
-// Weekly reset is handled logically by weekId.
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
 const CLAIMS_FILE = path.join(DATA_DIR, "claims.json");
 
+// --- config ---
+const CHALLENGE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const PENDING_TTL_MS = 20 * 60 * 1000;   // 20 minutes
+
 function currentWeekIdUTC() {
-  // Week counter within year (simple, deterministic; good enough for weekly reset)
   const d = new Date();
   const year = d.getUTCFullYear();
   const start = new Date(Date.UTC(year, 0, 1));
@@ -75,44 +72,53 @@ function currentWeekIdUTC() {
   return `${year}-W${String(week).padStart(2, "0")}`;
 }
 
-function loadClaims() {
+function loadDb() {
   const weekId = currentWeekIdUTC();
   try {
     const db = JSON.parse(fs.readFileSync(CLAIMS_FILE, "utf8"));
-
-    // Weekly reset
     if (!db.weekId || db.weekId !== weekId) {
-      return { weekId, claimed: {}, pending: {} };
+      return { weekId, claimed: {}, pending: {}, challenges: {} };
     }
-
     return {
       weekId,
       claimed: db.claimed || {},
       pending: db.pending || {},
+      challenges: db.challenges || {},
     };
   } catch {
-    return { weekId, claimed: {}, pending: {} };
+    return { weekId, claimed: {}, pending: {}, challenges: {} };
   }
 }
 
-function saveClaims(db) {
+function saveDb(db) {
   fs.writeFileSync(CLAIMS_FILE, JSON.stringify(db, null, 2));
 }
 
-function u64Amount(human, decimals) {
-  const factor = 10 ** decimals;
-  const v = Math.round(human * factor);
-  if (!Number.isFinite(v) || v <= 0) throw new Error("Invalid amount");
-  return BigInt(v);
+function nowMs() {
+  return Date.now();
 }
 
-// Message user signs (no SOL, just signature)
-function buildClaimMessage(userPubkey, nonce) {
+function cleanupDb(db) {
+  const t = nowMs();
+
+  // expire challenges
+  for (const [wallet, ch] of Object.entries(db.challenges || {})) {
+    if (!ch?.expiresAt || t > ch.expiresAt) delete db.challenges[wallet];
+  }
+  // expire pending
+  for (const [wallet, p] of Object.entries(db.pending || {})) {
+    if (!p?.expiresAt || t > p.expiresAt) delete db.pending[wallet];
+  }
+}
+
+function buildClaimMessage(userPubkey, nonce, weekId, expiresAt) {
   return [
     "Flexion Support Mark (FSM) — Claim",
     "I am claiming FSM as a symbolic on-chain support badge.",
     `Wallet: ${userPubkey}`,
+    `Week: ${weekId}`,
     `Nonce: ${nonce}`,
+    `ExpiresAt: ${new Date(expiresAt).toISOString()}`,
     "No sale. No exchange. No expectations of profit.",
   ].join("\n");
 }
@@ -124,107 +130,217 @@ function verifySignatureBs58({ userPubkey, message, signature }) {
   return nacl.sign.detached.verify(msgBytes, sigBytes, pubkey.toBytes());
 }
 
+function parseHumanAmountToU64BigInt(humanStr, decimals) {
+  // Safe decimal parsing without float
+  // "1" with decimals=6 -> 1000000n
+  const s = String(humanStr).trim();
+  if (!s || s.startsWith("-")) throw new Error("Invalid amount");
+  const [iRaw, fRaw = ""] = s.split(".");
+  const i = iRaw.replace(/^0+(?=\d)/, "");
+  const f = fRaw.replace(/[^0-9]/g, "");
+  if (!/^\d+$/.test(i || "0")) throw new Error("Invalid amount");
+
+  const fPadded = (f + "0".repeat(decimals)).slice(0, decimals);
+  const full = (i || "0") + fPadded;
+  const v = BigInt(full || "0");
+  if (v <= 0n) throw new Error("Invalid amount");
+  return v;
+}
+
 async function ataExists(ata) {
   const info = await connection.getAccountInfo(ata, "confirmed");
   return !!info;
 }
 
+// Validate that txSig is a transfer of FSM from distributor ATA to user's ATA for expected amount
+async function validateTransferTx({ txSig, userWallet }) {
+  const parsed = await connection.getParsedTransaction(txSig, {
+    commitment: "confirmed",
+    maxSupportedTransactionVersion: 0,
+  });
+
+  if (!parsed) return { ok: false, reason: "Transaction not found" };
+  if (parsed.meta?.err) return { ok: false, reason: "Transaction failed" };
+
+  const userPk = new PublicKey(userWallet);
+  const userAta = getAssociatedTokenAddressSync(FSM_MINT, userPk);
+  const distributorAta = getAssociatedTokenAddressSync(FSM_MINT, DISTRIBUTOR.publicKey);
+  const expectedAmount = parseHumanAmountToU64BigInt(FSM_AMOUNT_HUMAN, FSM_DECIMALS);
+
+  const ixs = parsed.transaction.message.instructions || [];
+  let matched = false;
+
+  for (const ix of ixs) {
+    if (ix?.program !== "spl-token") continue;
+    const p = ix?.parsed;
+    if (!p || p.type !== "transfer") continue;
+
+    const info = p.info || {};
+    // parsed amounts are strings in base units for spl-token transfer
+    const amountStr = String(info.amount ?? "");
+    if (!/^\d+$/.test(amountStr)) continue;
+
+    const amount = BigInt(amountStr);
+    const source = String(info.source ?? "");
+    const destination = String(info.destination ?? "");
+    const authority = String(info.authority ?? "");
+
+    if (
+      source === distributorAta.toBase58() &&
+      destination === userAta.toBase58() &&
+      authority === DISTRIBUTOR.publicKey.toBase58() &&
+      amount === expectedAmount
+    ) {
+      matched = true;
+      break;
+    }
+  }
+
+  if (!matched) return { ok: false, reason: "Tx does not match expected FSM transfer" };
+  return { ok: true };
+}
+
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// Step 1: create and return fully-signed transfer tx (distributor pays fees)
-app.post("/claim", async (req, res) => {
-  const { wallet, signature, nonce } = req.body || {};
-
+// Step 0: server issues challenge (nonce + message)
+app.post("/challenge", async (req, res) => {
   try {
-    if (!wallet || !signature || !nonce) {
-      return res.status(400).json({ error: "wallet, signature, nonce required" });
-    }
+    const { wallet } = req.body || {};
+    if (!wallet) return res.status(400).json({ error: "wallet required" });
 
     const userPk = new PublicKey(wallet);
+    void userPk; // validate pubkey format
 
-    // weekly-scoped gating
-    const db = loadClaims();
+    const db = loadDb();
+    cleanupDb(db);
+
     if (db.claimed[wallet]) {
       return res.json({ alreadyClaimed: true, weekId: db.weekId });
     }
 
-    const message = buildClaimMessage(wallet, String(nonce));
+    const nonce = bs58.encode(nacl.randomBytes(16)); // server nonce
+    const expiresAt = nowMs() + CHALLENGE_TTL_MS;
+    const message = buildClaimMessage(wallet, nonce, db.weekId, expiresAt);
 
-    // Reserve "pending" to prevent rapid double-claims
+    db.challenges[wallet] = { nonce, expiresAt, message };
+    saveDb(db);
+
+    return res.json({ message, nonce, expiresAt, weekId: db.weekId });
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+// Step 1: client sends signature of server message; server returns fully signed tx
+app.post("/claim", async (req, res) => {
+  const { wallet, signature } = req.body || {};
+
+  try {
+    if (!wallet || !signature) {
+      return res.status(400).json({ error: "wallet, signature required" });
+    }
+
+    const userPk = new PublicKey(wallet);
+
+    const db = loadDb();
+    cleanupDb(db);
+
+    if (db.claimed[wallet]) {
+      return res.json({ alreadyClaimed: true, weekId: db.weekId });
+    }
+
+    const ch = db.challenges[wallet];
+    if (!ch) return res.status(400).json({ error: "No active challenge. Call /challenge first." });
+    if (nowMs() > ch.expiresAt) {
+      delete db.challenges[wallet];
+      saveDb(db);
+      return res.status(400).json({ error: "Challenge expired. Call /challenge again." });
+    }
+
+    if (!verifySignatureBs58({ userPubkey: wallet, message: ch.message, signature })) {
+      return res.status(400).json({ error: "Invalid signature" });
+    }
+
+    // Prevent concurrent claim attempts
     if (db.pending[wallet]) {
       return res.status(429).json({ error: "Claim already pending for this wallet" });
     }
-    db.pending[wallet] = { at: Date.now() };
-    saveClaims(db);
 
-    // Build token transfer
+    // Mark pending + consume challenge (one-time)
+    db.pending[wallet] = { at: nowMs(), expiresAt: nowMs() + PENDING_TTL_MS };
+    delete db.challenges[wallet];
+    saveDb(db);
+
     const distributorAta = getAssociatedTokenAddressSync(FSM_MINT, DISTRIBUTOR.publicKey);
     const userAta = getAssociatedTokenAddressSync(FSM_MINT, userPk);
 
     const ixs = [];
 
-    // Create user's ATA if missing (paid by distributor)
     if (!(await ataExists(userAta))) {
       ixs.push(
         createAssociatedTokenAccountInstruction(
           DISTRIBUTOR.publicKey, // payer
-          userAta, // ata
-          userPk, // owner
-          FSM_MINT // mint
+          userAta,
+          userPk,
+          FSM_MINT
         )
       );
     }
 
-    const amount = u64Amount(FSM_AMOUNT_HUMAN, FSM_DECIMALS);
+    const amount = parseHumanAmountToU64BigInt(FSM_AMOUNT_HUMAN, FSM_DECIMALS);
     ixs.push(createTransferInstruction(distributorAta, userAta, DISTRIBUTOR.publicKey, amount));
 
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
 
-    // Distributor pays the network fee -> user needs 0 SOL
     const tx = new Transaction({
       feePayer: DISTRIBUTOR.publicKey,
       blockhash,
       lastValidBlockHeight,
     }).add(...ixs);
 
-    // Fully sign with distributor (fee payer + transfer authority + ATA payer)
     tx.sign(DISTRIBUTOR);
 
     const txBase64 = tx.serialize().toString("base64");
-    return res.json({ txBase64, message, weekId: db.weekId });
+    return res.json({ txBase64, weekId: db.weekId });
   } catch (e) {
-    // clean pending on error
+    // best-effort: clear pending on failure
     try {
       if (wallet) {
-        const db = loadClaims();
+        const db = loadDb();
         delete db.pending[wallet];
-        saveClaims(db);
+        saveDb(db);
       }
     } catch {}
-
     return res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-// Step 2: client calls this AFTER submitting tx (with tx signature)
+// Step 2: client confirms after sending tx; server verifies tx content
 app.post("/confirm", async (req, res) => {
   try {
     const { wallet, txSig } = req.body || {};
     if (!wallet || !txSig) return res.status(400).json({ error: "wallet, txSig required" });
 
-    const db = loadClaims();
-    if (!db.pending[wallet] && !db.claimed[wallet]) {
+    const db = loadDb();
+    cleanupDb(db);
+
+    if (db.claimed[wallet]) return res.json({ ok: true, weekId: db.weekId });
+
+    if (!db.pending[wallet]) {
       return res.status(400).json({ error: "No pending claim for this wallet" });
     }
 
     const st = await connection.getSignatureStatus(txSig, { searchTransactionHistory: true });
-    const ok =
-      st?.value?.confirmationStatus === "confirmed" || st?.value?.confirmationStatus === "finalized";
+    const cs = st?.value?.confirmationStatus;
+    const ok = cs === "confirmed" || cs === "finalized";
     if (!ok) return res.status(400).json({ error: "Transaction not confirmed yet" });
 
-    db.claimed[wallet] = { txSig, at: Date.now() };
+    const v = await validateTransferTx({ txSig, userWallet: wallet });
+    if (!v.ok) return res.status(400).json({ error: v.reason });
+
+    db.claimed[wallet] = { txSig, at: nowMs() };
     delete db.pending[wallet];
-    saveClaims(db);
+    saveDb(db);
 
     return res.json({ ok: true, weekId: db.weekId });
   } catch (e) {
