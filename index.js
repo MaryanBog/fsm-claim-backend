@@ -1,18 +1,19 @@
-// index.js — minimal FSM claim backend (Railway)
+// index.js — minimal FSM claim backend (Render)
 // Node 18+
 //
 // Endpoints:
-//   POST /claim   -> returns { txBase64, message, alreadyClaimed? }
-//   POST /confirm -> returns { ok: true } after client submits tx
+//   GET  /health   -> { ok: true }
+//   POST /claim    -> returns { txBase64, message, alreadyClaimed?, weekId? }
+//   POST /confirm  -> returns { ok: true } after client submits tx
 //
 // Env vars required:
 //   RPC_URL=...
 //   FSM_MINT=7Admm1BZYi91xaS54D3ELnbP78VM1a1creUe2uVcibZ2
 //   FSM_DECIMALS=6
-//   FSM_AMOUNT=1                 // "1 FSM" (human units)
-//   DISTRIBUTOR_SECRET_KEY=[...] // Solana keypair secretKey array (JSON), e.g. from `solana-keygen grind`
-//   ALLOWED_ORIGIN=https://lockrion.com  (optional)
-//   PORT=3000 (Railway provides)
+//   FSM_AMOUNT=1
+//   DISTRIBUTOR_SECRET_KEY=[...]  // Solana keypair secretKey array JSON
+//   ALLOWED_ORIGIN=https://lockrion.com (optional)
+//   PORT=3000 (Render provides)
 
 // --- deps ---
 // npm i express cors tweetnacl bs58 @solana/web3.js @solana/spl-token
@@ -22,7 +23,8 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import nacl from "tweetnacl";
-import { PublicKey, Connection, Keypair, Transaction, SystemProgram } from "@solana/web3.js";
+import bs58 from "bs58";
+import { PublicKey, Connection, Keypair, Transaction } from "@solana/web3.js";
 import {
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
@@ -57,24 +59,47 @@ const DISTRIBUTOR = Keypair.fromSecretKey(Uint8Array.from(distributorSecret));
 
 const connection = new Connection(RPC_URL, "confirmed");
 
-// simple local store (works on a single instance).
-// If you scale to multiple instances, switch to Redis.
+// Store claims locally (weekly reset).
+// NOTE: On Render Free this filesystem may reset on redeploy/restart.
+// Weekly reset is handled logically by weekId.
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
 const CLAIMS_FILE = path.join(DATA_DIR, "claims.json");
 
+function currentWeekIdUTC() {
+  // Week counter within year (simple, deterministic; good enough for weekly reset)
+  const d = new Date();
+  const year = d.getUTCFullYear();
+  const start = new Date(Date.UTC(year, 0, 1));
+  const day = Math.floor((d - start) / 86400000) + 1;
+  const week = Math.ceil(day / 7);
+  return `${year}-W${String(week).padStart(2, "0")}`;
+}
+
 function loadClaims() {
+  const weekId = currentWeekIdUTC();
   try {
-    return JSON.parse(fs.readFileSync(CLAIMS_FILE, "utf8"));
+    const db = JSON.parse(fs.readFileSync(CLAIMS_FILE, "utf8"));
+
+    // Weekly reset
+    if (!db.weekId || db.weekId !== weekId) {
+      return { weekId, claimed: {}, pending: {} };
+    }
+
+    return {
+      weekId,
+      claimed: db.claimed || {},
+      pending: db.pending || {},
+    };
   } catch {
-    return { claimed: {}, pending: {} };
+    return { weekId, claimed: {}, pending: {} };
   }
 }
+
 function saveClaims(db) {
   fs.writeFileSync(CLAIMS_FILE, JSON.stringify(db, null, 2));
 }
 
 function u64Amount(human, decimals) {
-  // integer math, safe for small airdrop amounts
   const factor = 10 ** decimals;
   const v = Math.round(human * factor);
   if (!Number.isFinite(v) || v <= 0) throw new Error("Invalid amount");
@@ -92,15 +117,6 @@ function buildClaimMessage(userPubkey, nonce) {
   ].join("\n");
 }
 
-function verifySignature({ userPubkey, message, signatureBase58 }) {
-  const pubkey = new PublicKey(userPubkey);
-  const msgBytes = new TextEncoder().encode(message);
-  const sigBytes = Uint8Array.from(Buffer.from(signatureBase58, "base58")); // won't work (Buffer doesn't support base58)
-  // use bs58:
-}
-
-import bs58 from "bs58";
-
 function verifySignatureBs58({ userPubkey, message, signature }) {
   const pubkey = new PublicKey(userPubkey);
   const msgBytes = new TextEncoder().encode(message);
@@ -115,20 +131,21 @@ async function ataExists(ata) {
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// Step 1: create and return partially-signed transfer tx
+// Step 1: create and return fully-signed transfer tx (distributor pays fees)
 app.post("/claim", async (req, res) => {
+  const { wallet, signature, nonce } = req.body || {};
+
   try {
-    const { wallet, signature, nonce } = req.body || {};
     if (!wallet || !signature || !nonce) {
       return res.status(400).json({ error: "wallet, signature, nonce required" });
     }
 
     const userPk = new PublicKey(wallet);
 
-    // idempotency / gating
+    // weekly-scoped gating
     const db = loadClaims();
     if (db.claimed[wallet]) {
-      return res.json({ alreadyClaimed: true });
+      return res.json({ alreadyClaimed: true, weekId: db.weekId });
     }
 
     const message = buildClaimMessage(wallet, String(nonce));
@@ -155,47 +172,40 @@ app.post("/claim", async (req, res) => {
       ixs.push(
         createAssociatedTokenAccountInstruction(
           DISTRIBUTOR.publicKey, // payer
-          userAta,               // ata
-          userPk,                // owner
-          FSM_MINT               // mint
+          userAta, // ata
+          userPk, // owner
+          FSM_MINT // mint
         )
       );
     }
 
     const amount = u64Amount(FSM_AMOUNT_HUMAN, FSM_DECIMALS);
-    ixs.push(
-      createTransferInstruction(
-        distributorAta,
-        userAta,
-        DISTRIBUTOR.publicKey,
-        amount
-      )
-    );
+    ixs.push(createTransferInstruction(distributorAta, userAta, DISTRIBUTOR.publicKey, amount));
 
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
 
+    // Distributor pays the network fee -> user needs 0 SOL
     const tx = new Transaction({
-      feePayer: userPk, // user pays fee (tiny). If you want distributor to pay: set feePayer=DISTRIBUTOR.publicKey
+      feePayer: DISTRIBUTOR.publicKey,
       blockhash,
       lastValidBlockHeight,
     }).add(...ixs);
 
-    // If feePayer is user, only distributor signs the transfer authority
-    // (user will sign as fee payer when submitting)
-    tx.partialSign(DISTRIBUTOR);
+    // Fully sign with distributor (fee payer + transfer authority + ATA payer)
+    tx.sign(DISTRIBUTOR);
 
-    const txBase64 = tx.serialize({ requireAllSignatures: false }).toString("base64");
-    return res.json({ txBase64, message });
+    const txBase64 = tx.serialize().toString("base64");
+    return res.json({ txBase64, message, weekId: db.weekId });
   } catch (e) {
     // clean pending on error
     try {
-      const { wallet } = req.body || {};
       if (wallet) {
         const db = loadClaims();
         delete db.pending[wallet];
         saveClaims(db);
       }
     } catch {}
+
     return res.status(500).json({ error: String(e?.message || e) });
   }
 });
@@ -211,16 +221,16 @@ app.post("/confirm", async (req, res) => {
       return res.status(400).json({ error: "No pending claim for this wallet" });
     }
 
-    // verify tx exists on chain (confirmed)
     const st = await connection.getSignatureStatus(txSig, { searchTransactionHistory: true });
-    const ok = st?.value?.confirmationStatus === "confirmed" || st?.value?.confirmationStatus === "finalized";
+    const ok =
+      st?.value?.confirmationStatus === "confirmed" || st?.value?.confirmationStatus === "finalized";
     if (!ok) return res.status(400).json({ error: "Transaction not confirmed yet" });
 
     db.claimed[wallet] = { txSig, at: Date.now() };
     delete db.pending[wallet];
     saveClaims(db);
 
-    return res.json({ ok: true });
+    return res.json({ ok: true, weekId: db.weekId });
   } catch (e) {
     return res.status(500).json({ error: String(e?.message || e) });
   }
@@ -231,4 +241,5 @@ app.listen(PORT, () => {
   console.log(`FSM claim backend listening on :${PORT}`);
   console.log(`Distributor: ${DISTRIBUTOR.publicKey.toBase58()}`);
   console.log(`Mint: ${FSM_MINT.toBase58()}`);
+  console.log(`WeekId: ${currentWeekIdUTC()}`);
 });
