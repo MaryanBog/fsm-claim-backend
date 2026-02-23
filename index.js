@@ -27,6 +27,7 @@ import { PublicKey, Connection, Keypair, Transaction } from "@solana/web3.js";
 import {
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
+  createAssociatedTokenAccountIdempotentInstruction,
   createTransferInstruction,
 } from "@solana/spl-token";
 
@@ -161,11 +162,6 @@ function parseHumanAmountToU64BigInt(humanStr, decimals) {
   return v;
 }
 
-async function ataExists(ata) {
-  const info = await connection.getAccountInfo(ata, "confirmed");
-  return !!info;
-}
-
 // Validate that txSig is a transfer of FSM from distributor ATA to user's ATA for expected amount
 async function validateTransferTx({ txSig, userWallet }) {
   const parsed = await connection.getParsedTransaction(txSig, {
@@ -293,11 +289,11 @@ app.post("/claim", async (req, res) => {
     // Create user's ATA if missing (paid by distributor)
     if (!(await ataExists(userAta))) {
       ixs.push(
-        createAssociatedTokenAccountInstruction(
+        createAssociatedTokenAccountIdempotentInstruction(
           DISTRIBUTOR.publicKey, // payer
-          userAta, // ata
-          userPk, // owner
-          FSM_MINT // mint
+          userAta,               // ata
+          userPk,                // owner
+          FSM_MINT               // mint
         )
       );
     }
