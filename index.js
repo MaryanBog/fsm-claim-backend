@@ -150,10 +150,6 @@ app.post("/claim", async (req, res) => {
 
     const message = buildClaimMessage(wallet, String(nonce));
 
-    if (!verifySignatureBs58({ userPubkey: wallet, message, signature })) {
-      return res.status(400).json({ error: "Invalid signature" });
-    }
-
     // Reserve "pending" to prevent rapid double-claims
     if (db.pending[wallet]) {
       return res.status(429).json({ error: "Claim already pending for this wallet" });
