@@ -129,6 +129,21 @@ function buildClaimMessage(userPubkey, nonce, weekId, expiresAt) {
   ].join("\n");
 }
 
+async function getLatestBlockhashWithRetry(max = 5) {
+  let lastErr;
+  for (let i = 0; i < max; i++) {
+    try {
+      return await connection.getLatestBlockhash("confirmed");
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.message || e);
+      if (!msg.includes("429")) throw e;
+      await new Promise(r => setTimeout(r, 400 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 /**
  * NOTE: name kept as-is ("Bs58") to avoid touching call-sites.
  * Actual expected encoding for `signature` here is BASE64 (from the frontend).
@@ -308,7 +323,7 @@ app.post("/claim", async (req, res) => {
     );
 
     const { blockhash, lastValidBlockHeight } =
-      await connection.getLatestBlockhash("confirmed");
+    await getLatestBlockhashWithRetry();
 
     const tx = new Transaction({
       feePayer: DISTRIBUTOR.publicKey,
